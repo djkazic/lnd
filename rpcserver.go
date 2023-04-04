@@ -5611,6 +5611,7 @@ func (r *rpcServer) AddInvoice(ctx context.Context,
 		Private:         invoice.Private,
 		RouteHints:      routeHints,
 		Amp:             invoice.IsAmp,
+		MinHopHints:     invoice.MinHopHints,
 	}
 
 	if invoice.RPreimage != nil {
