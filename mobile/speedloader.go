@@ -311,7 +311,7 @@ func GossipSync(cacheDir string, dataDir string, callback Callback) {
 	// Open channel.db as dest
 	service, release, err := serviceRefCounter.Get(
 		func() (interface{}, refcount.ReleaseFunc, error) {
-			return newService(dataDir + "/files")
+			return newService(dataDir)
 		},
 	)
 	if err != nil {
