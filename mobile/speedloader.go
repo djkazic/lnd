@@ -242,7 +242,7 @@ func GossipSync(cacheDir string, dataDir string, callback Callback) {
 	if err == nil {
 		modifiedTime := info.ModTime()
 		now := time.Now()
-		diff := modifiedTime.Sub(now)
+		diff := now.Sub(modifiedTime)
 		if diff.Hours() <= 24 {
 			useDGraph = true
 		}
@@ -257,7 +257,7 @@ func GossipSync(cacheDir string, dataDir string, callback Callback) {
 	if err == nil {
 		modifiedTime := lastRun.ModTime()
 		now := time.Now()
-		diff := modifiedTime.Sub(now)
+		diff := now.Sub(modifiedTime)
 		if !firstRun && diff.Hours() <= 24 {
 			// Abort
 			callback.OnResponse([]byte("skip_time_constraint"))
@@ -389,6 +389,13 @@ func GossipSync(cacheDir string, dataDir string, callback Callback) {
 			_, shouldCopy := bucketsToCopy[pathElements[0]]
 			return !shouldCopy
 		})
+	if err != nil {
+		callback.OnError(err)
+		return
+	}
+	// Update the lastrun modified time
+	now := time.Now()
+	err = os.Chtimes(lastRunPath, now, now)
 	if err != nil {
 		callback.OnError(err)
 		return
