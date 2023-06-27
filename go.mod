@@ -205,7 +205,16 @@ replace github.com/gogo/protobuf => github.com/gogo/protobuf v1.3.2
 // We want to format raw bytes as hex instead of base64. The forked version
 // allows us to specify that as an option.
 replace google.golang.org/protobuf => github.com/lightninglabs/protobuf-go-hex-display v1.30.0-hex-display
+
 replace github.com/lightningnetwork/lnd/tor => ./tor
+
+replace github.com/breez/breez => github.com/djkazic/breez v0.0.8
+
+replace github.com/btcsuite/btcwallet => github.com/djkazic/btcwallet v1.5.7
+
+replace github.com/btcsuite/btcwallet/walletdb => github.com/djkazic/btcwallet/walletdb v1.5.7
+
+replace github.com/lightningnetwork/lnd/kvdb => ./kvdb
 
 // If you change this please also update .github/pull_request_template.md and
 // docs/INSTALL.md.
