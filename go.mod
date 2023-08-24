@@ -17,6 +17,7 @@ require (
 	github.com/coreos/go-systemd v0.0.0-20190719114852-fd7a80b32e1f
 	github.com/davecgh/go-spew v1.1.1
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1
+	github.com/gabstv/go-bsdiff v1.0.5
 	github.com/go-errors/errors v1.0.1
 	github.com/golang-migrate/migrate/v4 v4.16.1
 	github.com/gorilla/websocket v1.4.2
