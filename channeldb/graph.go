@@ -248,53 +248,51 @@ func (c *ChannelGraph) startWorker() {
 }
 
 func (c *ChannelGraph) enqueueWriteOperation(op func() error) {
-	// Send the operation to the channel; non-blocking if the buffer isn't full
+	// Send the operation to the channel.
+	// This is non-blocking as long as the buffer isn't full.
 	select {
 	case c.writeOps <- op:
 		// Operation enqueued successfully
 	default:
-		// Handle the case where the channel is full
-		// Could log an error, block until space is available, or drop the operation
-		// For example, to block until space is available, remove the select and default case
 		log.Warn("writeOps queue is full, operation not enqueued")
 	}
 }
 
-func (g *ChannelGraph) populateGraphCache() {
+func (c *ChannelGraph) populateGraphCache() {
 	startTime := time.Now()
 	log.Debugf("Populating in-memory channel graph, this might " +
 		"take a while...")
 
-	err := g.ForEachNodeCacheable(
+	err := c.ForEachNodeCacheable(
 		func(tx kvdb.RTx, node GraphCacheNode) error {
-			g.graphCache.AddNodeFeatures(node)
+			c.graphCache.AddNodeFeatures(node)
 
 			return nil
 		},
 	)
 	if err != nil {
-		g.graphCacheErr = err
+		c.graphCacheErr = err
 		return
 	}
 
-	err = g.ForEachChannel(func(info *models.ChannelEdgeInfo,
+	err = c.ForEachChannel(func(info *models.ChannelEdgeInfo,
 		policy1, policy2 *models.ChannelEdgePolicy) error {
 
-		g.graphCache.AddChannel(info, policy1, policy2)
+		c.graphCache.AddChannel(info, policy1, policy2)
 
 		return nil
 	})
 	if err != nil {
-		g.graphCacheErr = err
+		c.graphCacheErr = err
 		return
 	}
 
-	if g.graphCache != nil {
+	if c.graphCache != nil {
 		log.Debugf("Finished populating in-memory channel graph (took "+
-			"%v, %s)", time.Since(startTime), g.graphCache.Stats())
+			"%v, %s)", time.Since(startTime), c.graphCache.Stats())
 	}
 
-	g.graphCacheReady.Store(true)
+	c.graphCacheReady.Store(true)
 }
 
 func (c *ChannelGraph) getGraphCache() (*GraphCache, error) {
@@ -304,8 +302,7 @@ func (c *ChannelGraph) getGraphCache() (*GraphCache, error) {
 
 	// Check if graph cache is ready without waiting
 	if !c.graphCacheReady.Load() {
-		// Return an error or a special indicator that cache is not ready
-		// Caller should handle this case appropriately, maybe by queuing write operations
+		// Return an error to show that cache is not ready.
 		return nil, ErrGraphCacheNotReady
 	}
 
@@ -1011,8 +1008,10 @@ func (c *ChannelGraph) DeleteLightningNode(nodePub route.Vertex) error {
 				c.enqueueWriteOperation(func() error {
 					return c.DeleteLightningNode(nodePub)
 				})
+
 				return nil
 			}
+
 			return err
 		}
 
@@ -1154,8 +1153,10 @@ func (c *ChannelGraph) addChannelEdge(tx kvdb.RwTx,
 			c.enqueueWriteOperation(func() error {
 				return c.addChannelEdge(tx, edge)
 			})
+
 			return nil
 		}
+
 		return err
 	}
 
@@ -2668,7 +2669,15 @@ func (c *ChannelGraph) delChannelEdgeUnsafe(edges, edgeIndex, chanIndex,
 		if errors.Is(err, ErrGraphCacheNotReady) {
 			// Queue this delete function
 			c.enqueueWriteOperation(func() error {
-				return c.delChannelEdgeUnsafe(edges, edgeIndex, chanIndex, zombieIndex, chanID, isZombie, strictZombie)
+				return c.delChannelEdgeUnsafe(
+					edges,
+					edgeIndex,
+					chanIndex,
+					zombieIndex,
+					chanID,
+					isZombie,
+					strictZombie,
+				)
 			})
 			return nil
 		}
@@ -3830,7 +3839,11 @@ func (c *ChannelGraph) MarkEdgeZombie(chanID uint64,
 			if errors.Is(err, ErrGraphCacheNotReady) {
 				// Queue this function
 				c.enqueueWriteOperation(func() error {
-					return c.MarkEdgeZombie(chanID, pubKey1, pubKey2)
+					return c.MarkEdgeZombie(
+						chanID,
+						pubKey1,
+						pubKey2,
+					)
 				})
 				return nil
 			}
