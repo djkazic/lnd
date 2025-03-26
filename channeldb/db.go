@@ -474,8 +474,14 @@ func (d *DB) Wipe() error {
 // the database are created.
 func initChannelDB(db kvdb.Backend) error {
 	err := kvdb.Update(db, func(tx kvdb.RwTx) error {
+		// Ensure that the historical channel bucket exists
+		_, err := tx.CreateTopLevelBucket(historicalChannelBucket)
+		if err != nil {
+			return err
+		}
+
 		// Check if DB was marked as inactive with a tomb stone.
-		if err := EnsureNoTombstone(tx); err != nil {
+		if err = EnsureNoTombstone(tx); err != nil {
 			return err
 		}
 
