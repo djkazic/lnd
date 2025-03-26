@@ -73,7 +73,14 @@ func (n *NoChainBackend) RegisterSpendNtfn(*wire.OutPoint, []byte,
 func (n *NoChainBackend) RegisterBlockEpochNtfn(
 	*chainntnfs.BlockEpoch) (*chainntnfs.BlockEpochEvent, error) {
 
-	epochChan := make(chan *chainntnfs.BlockEpoch)
+	epochChan := make(chan *chainntnfs.BlockEpoch, 1)
+
+	block := &chainntnfs.BlockEpoch{
+		Hash:   noChainBackendBestHash,
+		Height: noChainBackendBestHeight,
+	}
+	epochChan <- block
+
 	return &chainntnfs.BlockEpochEvent{
 		Epochs: epochChan,
 		Cancel: func() {
