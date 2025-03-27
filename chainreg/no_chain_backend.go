@@ -75,7 +75,11 @@ func (n *NoChainBackend) RegisterBlockEpochNtfn(
 
 	epochChan := make(chan *chainntnfs.BlockEpoch, 1)
 
+	blockHeader := &wire.BlockHeader{
+		Nonce: 1,
+	}
 	block := &chainntnfs.BlockEpoch{
+		BlockHeader: blockHeader,
 		Hash:   noChainBackendBestHash,
 		Height: noChainBackendBestHeight,
 	}
