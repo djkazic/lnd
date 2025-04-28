@@ -1348,6 +1348,10 @@ func EncodeFailure(w io.Writer, failure FailureMessage, pver uint32) error {
 // EncodeFailureMessage encodes just the failure message without adding a length
 // and padding the message for the onion protocol.
 func EncodeFailureMessage(w io.Writer, failure FailureMessage, pver uint32) error {
+	if failure == nil {
+		return nil
+	}
+
 	// First, we'll write out the error code itself into the failure
 	// buffer.
 	var codeBytes [2]byte
