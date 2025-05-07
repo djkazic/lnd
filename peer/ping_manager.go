@@ -151,10 +151,16 @@ func (m *PingManager) pingHandler() {
 			m.cfg.SendPing(ping)
 
 		case <-m.pingTimeout.C:
+			var elapsed time.Duration
+
+			if m.pingLastSend != nil {
+				elapsed = time.Since(*m.pingLastSend)
+			}
+
 			m.resetPingState()
 
-			e := errors.New("timeout while waiting for " +
-				"pong response",
+			e := errors.New(fmt.Sprintf("timeout while waiting for " +
+				"pong response (elapsed: %s)", elapsed),
 			)
 
 			m.cfg.OnPongFailure(e)
