@@ -654,7 +654,7 @@ func NewBrontide(cfg Config) *Brontide {
 		cfg:           cfg,
 		activeSignal:  make(chan struct{}),
 		sendQueue:     make(chan outgoingMsg),
-		outgoingQueue: make(chan outgoingMsg),
+		outgoingQueue: make(chan outgoingMsg, 10),
 		addedChannels: &lnutils.SyncMap[lnwire.ChannelID, struct{}]{},
 		activeChannels: &lnutils.SyncMap[
 			lnwire.ChannelID, *lnwallet.LightningChannel,
