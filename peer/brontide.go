@@ -1830,6 +1830,8 @@ func (ms *msgStream) msgConsumer() {
 // AddMsg adds a new message to the msgStream. This function is safe for
 // concurrent access.
 func (ms *msgStream) AddMsg(msg lnwire.Message) {
+	start := time.Now()
+
 	// First, we'll attempt to receive from the producerSema struct. This
 	// acts as a semaphore to prevent us from indefinitely buffering
 	// incoming items from the wire. Either the msg queue isn't full, and
@@ -1841,6 +1843,11 @@ func (ms *msgStream) AddMsg(msg lnwire.Message) {
 		return
 	case <-ms.quit:
 		return
+	}
+
+	delay := time.Since(start)
+	if delay > 250 * time.Millisecond {
+		ms.peer.log.Warnf("AddMsg blocked %s waiting for producerSema", delay)
 	}
 
 	// Next, we'll lock the condition, and add the message to the end of
