@@ -2779,7 +2779,6 @@ func (p *Brontide) queueHandler() {
 				if sendStart.IsZero() {
 					sendStart = time.Now()
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
 		} else {
 			// If there weren't any messages to send to the
