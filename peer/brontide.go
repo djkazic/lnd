@@ -2802,6 +2802,11 @@ func (p *Brontide) queue(priority bool, msg lnwire.Message,
 		if errChan != nil {
 			errChan <- lnpeer.ErrPeerExiting
 		}
+	default:
+		if errChan == nil && msg.MsgType() == lnwire.MsgPing {
+			p.log.Warnf("Ping message dropped! " +
+				"outgoingQueue has no active receiver")
+		}
 	}
 }
 
