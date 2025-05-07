@@ -2719,6 +2719,9 @@ func (p *Brontide) queueHandler() {
 	// been queued. This predominately includes messages from the gossiper.
 	lazyMsgs := list.New()
 
+	var lastQueueRecv time.Time
+	var sendStart time.Time
+
 	for {
 		// Examine the front of the priority queue, if it is empty check
 		// the low priority queue.
@@ -2737,12 +2740,27 @@ func (p *Brontide) queueHandler() {
 			// sendQueue.
 			select {
 			case p.sendQueue <- front:
+				if !sendStart.IsZero() {
+					delay := time.Since(sendStart)
+					if delay > 500 * time.Millisecond {
+						p.log.Warnf("queueHandler blocked %s trying to send to sendQueue", delay)
+					}
+					sendStart = time.Time{}
+				}
 				if front.priority {
 					priorityMsgs.Remove(elem)
 				} else {
 					lazyMsgs.Remove(elem)
 				}
 			case msg := <-p.outgoingQueue:
+				now := time.Now()
+				if !lastQueueRecv.IsZero() {
+					gap := now.Sub(lastQueueRecv)
+					if gap > 500 * time.Millisecond {
+						p.log.Warnf("queueHandler had %s gap between incoming msgs", gap)
+					}
+				}
+				lastQueueRecv = now
 				if msg.priority {
 					priorityMsgs.PushBack(msg)
 				} else {
@@ -2750,6 +2768,11 @@ func (p *Brontide) queueHandler() {
 				}
 			case <-p.cg.Done():
 				return
+			default:
+				if sendStart.IsZero() {
+					sendStart = time.Now()
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
 		} else {
 			// If there weren't any messages to send to the
@@ -2757,6 +2780,14 @@ func (p *Brontide) queueHandler() {
 			// into the queue from outside sub-systems.
 			select {
 			case msg := <-p.outgoingQueue:
+				now := time.Now()
+				if !lastQueueRecv.IsZero() {
+					gap := now.Sub(lastQueueRecv)
+					if gap > 500 * time.Millisecond {
+						p.log.Warnf("queueHandler had %s gap between incoming msgs", gap)
+					}
+				}
+				lastQueueRecv = now
 				if msg.priority {
 					priorityMsgs.PushBack(msg)
 				} else {
