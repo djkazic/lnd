@@ -654,7 +654,7 @@ func NewBrontide(cfg Config) *Brontide {
 		cfg:           cfg,
 		activeSignal:  make(chan struct{}),
 		sendQueue:     make(chan outgoingMsg),
-		outgoingQueue: make(chan outgoingMsg, 10),
+		outgoingQueue: make(chan outgoingMsg),
 		addedChannels: &lnutils.SyncMap[lnwire.ChannelID, struct{}]{},
 		activeChannels: &lnutils.SyncMap[
 			lnwire.ChannelID, *lnwallet.LightningChannel,
@@ -2801,11 +2801,6 @@ func (p *Brontide) queue(priority bool, msg lnwire.Message,
 			spew.Sdump(msg))
 		if errChan != nil {
 			errChan <- lnpeer.ErrPeerExiting
-		}
-	default:
-		if errChan == nil && msg.MsgType() == lnwire.MsgPing {
-			p.log.Warnf("Ping message dropped! " +
-				"outgoingQueue has no active receiver")
 		}
 	}
 }
