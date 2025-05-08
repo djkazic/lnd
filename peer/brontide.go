@@ -2727,51 +2727,67 @@ func (p *Brontide) queueHandler() {
 	lazyMsgs := list.New()
 
 	for {
-		// Examine the front of the priority queue, if it is empty check
-		// the low priority queue.
-		elem := priorityMsgs.Front()
-		if elem == nil {
+		// 1) First, drain any waiting incoming messages without blocking.
+		select {
+		case msg := <-p.outgoingQueue:
+			if msg.priority {
+				priorityMsgs.PushBack(msg)
+			} else {
+				lazyMsgs.PushBack(msg)
+			}
+			continue
+
+		case <-p.cg.Done():
+			return
+
+		default:
+		}
+
+		// 2) If no new incoming, see if we have something buffered.
+		var elem *list.Element
+		if front := priorityMsgs.Front(); front != nil {
+			elem = front
+		} else {
 			elem = lazyMsgs.Front()
 		}
 
-		if elem != nil {
-			front := elem.Value.(outgoingMsg)
+		// 3a) No buffered messages → block until next incoming or shutdown.
+		if elem == nil {
+			select {
+			case msg := <-p.outgoingQueue:
+				if msg.priority {
+					priorityMsgs.PushBack(msg)
+				} else {
+					lazyMsgs.PushBack(msg)
+				}
+			case <-p.cg.Done():
+				return
+			}
+			continue
+		}
 
-			// There's an element on the queue, try adding
-			// it to the sendQueue. We also watch for
-			// messages on the outgoingQueue, in case the
-			// writeHandler cannot accept messages on the
-			// sendQueue.
-			select {
-			case p.sendQueue <- front:
-				if front.priority {
-					priorityMsgs.Remove(elem)
-				} else {
-					lazyMsgs.Remove(elem)
-				}
-			case msg := <-p.outgoingQueue:
-				if msg.priority {
-					priorityMsgs.PushBack(msg)
-				} else {
-					lazyMsgs.PushBack(msg)
-				}
-			case <-p.cg.Done():
-				return
+		// 3b) We have a buffered message → block until we can either send it,
+		//     or read a new incoming, or shut down.
+		outMsg := elem.Value.(outgoingMsg)
+		select {
+		case p.sendQueue <- outMsg:
+			// Successfully flushed to sendQueue.
+			if outMsg.priority {
+				priorityMsgs.Remove(elem)
+			} else {
+				lazyMsgs.Remove(elem)
 			}
-		} else {
-			// If there weren't any messages to send to the
-			// writeHandler, then we'll accept a new message
-			// into the queue from outside sub-systems.
-			select {
-			case msg := <-p.outgoingQueue:
-				if msg.priority {
-					priorityMsgs.PushBack(msg)
-				} else {
-					lazyMsgs.PushBack(msg)
-				}
-			case <-p.cg.Done():
-				return
+
+		case msg := <-p.outgoingQueue:
+			// A new incoming message took priority.
+			if msg.priority {
+				priorityMsgs.PushBack(msg)
+			} else {
+				lazyMsgs.PushBack(msg)
 			}
+
+		case <-p.cg.Done():
+			return
 		}
 	}
 }
