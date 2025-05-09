@@ -2019,9 +2019,43 @@ func (p *Brontide) readHandler() {
 	// gossiper?
 	p.initGossipSync()
 
+	// Create a buffered channel to let us queue processing non control-flow
+	// messages (up to 128 messages deep). This avoids delaying the processing
+	// of light messages like Pongs.
+	var dataInboxWg sync.WaitGroup
+	dataInbox := make(chan lnwire.Message, 128)
+	dataInboxWg.Add(1)
+
 	discStream := newDiscMsgStream(p)
 	discStream.Start()
-	defer discStream.Stop()
+
+	// Setup deferred closure of dataInbox and discStream.
+	defer func() {
+		close(dataInbox)
+		dataInboxWg.Wait()
+		discStream.Stop()
+	}()
+
+	// We'll use a goroutine to drain the dataInbox queue into our discStream.
+	go func() {
+		defer dataInboxWg.Done()
+
+		for {
+			select {
+			case msg, ok := <- dataInbox:
+				if !ok {
+					// Channel closed, there's nothing to do.
+					return
+				}
+				// Potentially can block, but only within this worker.
+				discStream.AddMsg(msg)
+			case <-p.cg.Done():
+				// Peer is disconnecting.
+				return
+			}
+		}
+	}()
+
 out:
 	for atomic.LoadInt32(&p.disconnect) == 0 {
 		nextMsg, err := p.readNextMessage()
@@ -2190,7 +2224,9 @@ out:
 			*lnwire.ReplyChannelRange,
 			*lnwire.ReplyShortChanIDsEnd:
 
-			discStream.AddMsg(msg)
+			// If the message we received is data, we'll set it aside in the
+			// dataInbox. It will eventually be drained into discStream.
+			dataInbox <- msg
 
 		case *lnwire.Custom:
 			err := p.handleCustomMessage(msg)
