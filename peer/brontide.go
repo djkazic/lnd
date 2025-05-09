@@ -94,7 +94,7 @@ const (
 	torTimeoutMultiplier = 3
 
 	// msgStreamSize is the size of the message streams.
-	msgStreamSize = 256
+	msgStreamSize = 1000
 )
 
 var (
