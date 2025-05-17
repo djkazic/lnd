@@ -220,3 +220,5 @@ retract v0.0.2
 replace github.com/btcsuite/btcwallet/txrules => github.com/djkazic/btcwallet/wallet/txrules v1.2.2-allow-dust
 
 replace github.com/btcsuite/btcwallet/wallet/txrules => github.com/djkazic/btcwallet/wallet/txrules v1.2.2-allow-dust
+
+replace github.com/btcsuite/btcwallet => github.com/djkazic/btcwallet v0.16.13-allow-dust-v3
