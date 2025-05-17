@@ -216,3 +216,7 @@ replace google.golang.org/protobuf => github.com/lightninglabs/protobuf-go-hex-d
 go 1.23.6
 
 retract v0.0.2
+
+replace github.com/btcsuite/btcwallet/txrules => github.com/djkazic/btcwallet/wallet/txrules v1.2.2-allow-dust
+
+replace github.com/btcsuite/btcwallet/wallet/txrules => github.com/djkazic/btcwallet/wallet/txrules v1.2.2-allow-dust

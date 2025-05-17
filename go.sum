@@ -66,8 +66,6 @@ github.com/btcsuite/btcwallet v0.16.13 h1:JGu+wrihQ0I00ODb3w92JtBPbrHxZhbcvU01O+
 github.com/btcsuite/btcwallet v0.16.13/go.mod h1:H6dfoZcWPonM2wbVsR2ZBY0PKNZKdQyLAmnX8vL9JFA=
 github.com/btcsuite/btcwallet/wallet/txauthor v1.3.5 h1:Rr0njWI3r341nhSPesKQ2JF+ugDSzdPoeckS75SeDZk=
 github.com/btcsuite/btcwallet/wallet/txauthor v1.3.5/go.mod h1:+tXJ3Ym0nlQc/iHSwW1qzjmPs3ev+UVWMbGgfV1OZqU=
-github.com/btcsuite/btcwallet/wallet/txrules v1.2.2 h1:YEO+Lx1ZJJAtdRrjuhXjWrYsmAk26wLTlNzxt2q0lhk=
-github.com/btcsuite/btcwallet/wallet/txrules v1.2.2/go.mod h1:4v+grppsDpVn91SJv+mZT7B8hEV4nSmpREM4I8Uohws=
 github.com/btcsuite/btcwallet/wallet/txsizes v1.2.5 h1:93o5Xz9dYepBP4RMFUc9RGIFXwqP2volSWRkYJFrNtI=
 github.com/btcsuite/btcwallet/wallet/txsizes v1.2.5/go.mod h1:lQ+e9HxZ85QP7r3kdxItkiMSloSLg1PEGis5o5CXUQw=
 github.com/btcsuite/btcwallet/walletdb v1.5.1 h1:HgMhDNCrtEFPC+8q0ei5DQ5U9Tl4RCspA22DEKXlopI=
@@ -129,6 +127,8 @@ github.com/decred/dcrd/lru v1.1.2 h1:KdCzlkxppuoIDGEvCGah1fZRicrDH36IipvlB1ROkFY
 github.com/decred/dcrd/lru v1.1.2/go.mod h1:gEdCVgXs1/YoBvFWt7Scgknbhwik3FgVSzlnCcXL2N8=
 github.com/dhui/dktest v0.4.0 h1:z05UmuXZHO/bgj/ds2bGMBu8FI4WA+Ag/m3ghL+om7M=
 github.com/dhui/dktest v0.4.0/go.mod h1:v/Dbz1LgCBOi2Uki2nUqLBGa83hWBGFMu5MrgMDCc78=
+github.com/djkazic/btcwallet/wallet/txrules v1.2.2-allow-dust h1:OFcKkASKpV9IBoUgLTOgzTy8vL9YjFgRy/H3STSGuxk=
+github.com/djkazic/btcwallet/wallet/txrules v1.2.2-allow-dust/go.mod h1:4v+grppsDpVn91SJv+mZT7B8hEV4nSmpREM4I8Uohws=
 github.com/docker/cli v20.10.17+incompatible h1:eO2KS7ZFeov5UJeaDmIs1NFEDRf32PaqRpvoEkKBy5M=
 github.com/docker/cli v20.10.17+incompatible/go.mod h1:JLrzqnKDaYBop7H2jaqPtU4hHvMKP+vjCwu2uszcLI8=
 github.com/docker/distribution v2.8.2+incompatible h1:T3de5rq0dB1j30rp0sA2rER+m322EBzniBPB6ZIzuh8=
