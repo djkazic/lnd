@@ -1112,10 +1112,7 @@ func (c *KVStore) addChannelEdge(tx kvdb.RwTx,
 		&edge.NodeKey2Bytes,
 	}
 	for _, key := range keys {
-		err := putChanEdgePolicyUnknown(edges, edge.ChannelID, key[:])
-		if err != nil {
-			return err
-		}
+		_ = putChanEdgePolicyUnknown(edges, edge.ChannelID, key[:])
 	}
 
 	// Finally we add it to the channel index which maps channel points
