@@ -154,6 +154,30 @@ func NewSqlBackend(ctx context.Context, cfg *Config) (*db, error) {
 	}, nil
 }
 
+// KVTableName returns the name of the underlying table that stores all kv
+// pairs for this backend. It is exported so that callers performing bulk read
+// optimizations (e.g. the one-time payments KV->SQL migration) can query the
+// table directly instead of traversing the bucket hierarchy one operation at a
+// time.
+//
+// NOTE: The returned name is only meaningful when combined with KVBulkQuery,
+// which runs against the same connection/schema.
+func (db *db) KVTableName() string {
+	return db.table
+}
+
+// KVBulkQuery runs a read-only query directly against the underlying kv table
+// connection and returns the resulting rows. It is intended only for bulk read
+// optimizations such as the payments migration; regular access should go
+// through the bucket API.
+//
+// NOTE: The caller is responsible for closing the returned rows.
+func (db *db) KVBulkQuery(ctx context.Context, query string,
+	args ...interface{}) (*sql.Rows, error) {
+
+	return db.db.QueryContext(ctx, query, args...)
+}
+
 // getTimeoutCtx gets a timeout context for database requests.
 func (db *db) getTimeoutCtx() (context.Context, func()) {
 	if db.cfg.Timeout == time.Duration(0) {

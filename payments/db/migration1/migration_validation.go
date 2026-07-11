@@ -22,6 +22,20 @@ import (
 type migratedPaymentRef struct {
 	Hash      lntypes.Hash
 	PaymentID int64
+
+	// Payment is the source KV payment that was migrated, captured during
+	// migration so validation can compare against it without re-reading and
+	// re-deserializing it from the (potentially remote) KV backend. It is
+	// already in its post-migration comparison state (e.g. in-flight legacy
+	// zero-attempt terminalization has been applied).
+	Payment *MPPayment
+
+	// HasDuplicates is true if the source payment had a duplicate-payments
+	// bucket. Duplicate payments were a rare legacy bug, so the vast
+	// majority of payments have none; tracking this lets validation skip the
+	// duplicate comparison (and its per-payment KV read + SQL round-trip)
+	// entirely for the common case.
+	HasDuplicates bool
 }
 
 // validateMigratedPaymentBatch performs a structural validation pass by
@@ -54,66 +68,76 @@ func validateMigratedPaymentBatch(ctx context.Context,
 			len(rows), len(paymentIDs))
 	}
 
-	// Perform the structural check by comparing key fields from the KV
-	// store with the SQL store.
-	err = kvBackend.View(func(kvTx kvdb.RTx) error {
+	// Index the SQL rows by payment ID so we can pair each migrated payment
+	// with its freshly fetched SQL counterpart.
+	rowByID := make(map[int64]sqlc.FetchPaymentsByIDsMigRow, len(rows))
+	for _, row := range rows {
+		rowByID[row.ID] = row
+	}
+
+	// Perform the structural check by comparing key fields of the migrated
+	// KV payment with its SQL counterpart. We compare against the payment we
+	// already read during migration instead of re-reading it from the KV
+	// backend, which on a remote/emulated backend (e.g. postgres_kvdb) is a
+	// large cost multiplied across the whole batch.
+	var withDuplicates []migratedPaymentRef
+	for _, ref := range batch {
+		row, ok := rowByID[ref.PaymentID]
+		if !ok {
+			return fmt.Errorf("missing SQL row for payment %x "+
+				"(id=%d)", ref.Hash[:8], ref.PaymentID)
+		}
+
+		// ref.Payment is already in its post-migration comparison state
+		// (legacy zero-attempt terminalization was applied during
+		// migration), so no additional normalization is needed here.
+		err = structuralCompare(ref.Payment, row)
+		if err != nil {
+			// On structural mismatch, perform a deep comparison to
+			// produce a detailed diff.
+			deepErr := deepComparePayment(
+				ctx, cfg, sqlDB, row.ID, ref.Hash, ref.Payment,
+			)
+			if deepErr != nil {
+				return deepErr
+			}
+
+			// If deep comparison passes but structural failed,
+			// report the structural error as it indicates an
+			// unexpected inconsistency.
+			return err
+		}
+
+		if ref.HasDuplicates {
+			withDuplicates = append(withDuplicates, ref)
+		}
+	}
+
+	// Only the rare payments that actually had duplicate entries require a
+	// KV read and a per-payment SQL round-trip to validate. The common case
+	// (no duplicates) skips the KV transaction entirely.
+	if len(withDuplicates) == 0 {
+		return nil
+	}
+
+	return kvBackend.View(func(kvTx kvdb.RTx) error {
 		paymentsBucket := kvTx.ReadBucket(paymentsRootBucket)
 		if paymentsBucket == nil {
 			return fmt.Errorf("no payments bucket")
 		}
 
-		for _, row := range rows {
-			hash := row.PaymentIdentifier
-			var paymentHash lntypes.Hash
-			copy(paymentHash[:], hash)
-
-			paymentBucket := paymentsBucket.NestedReadBucket(hash)
+		for _, ref := range withDuplicates {
+			paymentBucket := paymentsBucket.NestedReadBucket(
+				ref.Hash[:],
+			)
 			if paymentBucket == nil {
 				return fmt.Errorf("missing payment bucket %x",
-					hash[:8])
+					ref.Hash[:8])
 			}
 
-			kvPayment, err := fetchPayment(paymentBucket)
-			if err != nil {
-				return fmt.Errorf("fetch KV payment %x: %w",
-					hash[:8], err)
-			}
-
-			if kvPayment.Status == StatusInFlight {
-				// Mirror the migration's legacy terminalization
-				// before comparing KV with SQL.
-				//
-				//nolint:ll
-				_, err = terminalizeUnresolvedLegacyZeroAttempts(
-					kvPayment,
-				)
-				if err != nil {
-					return fmt.Errorf("normalize KV "+
-						"payment %x: %w", hash[:8], err)
-				}
-			}
-
-			err = structuralCompare(kvPayment, row)
-			if err != nil {
-				// On structural mismatch, perform a deep
-				// comparison to produce a detailed diff.
-				deepErr := deepComparePayment(
-					ctx, cfg, sqlDB, row.ID,
-					paymentHash, kvPayment,
-				)
-				if deepErr != nil {
-					return deepErr
-				}
-
-				// If deep comparison passes but structural
-				// failed, report the structural error as it
-				// indicates an unexpected inconsistency.
-				return err
-			}
-
-			err = compareDuplicatePayments(
-				ctx, paymentBucket, sqlDB, row.ID,
-				paymentHash,
+			err := compareDuplicatePayments(
+				ctx, paymentBucket, sqlDB, ref.PaymentID,
+				ref.Hash,
 			)
 			if err != nil {
 				return err
@@ -122,11 +146,6 @@ func validateMigratedPaymentBatch(ctx context.Context,
 
 		return nil
 	}, func() {})
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // structuralCompare performs a fast structural comparison between a KV payment

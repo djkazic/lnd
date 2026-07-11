@@ -453,6 +453,78 @@ func TestCustomMigration(t *testing.T) {
 	}
 }
 
+// TestCustomMigrationWithCopier verifies the opt-in MigrationFnWithCopier
+// path: the migration runs on the dedicated-connection code path, the tracker
+// is updated atomically, and the injected BulkCopier is non-nil on Postgres
+// (which has COPY) and nil on SQLite (which falls back to inserts).
+func TestCustomMigrationWithCopier(t *testing.T) {
+	ctxb := t.Context()
+
+	// runOnce applies a single copier migration and returns whether the
+	// copier passed to it was nil, plus the recorded DB version.
+	runOnce := func(t *testing.T, db DB) (bool, int32) {
+		var (
+			called       bool
+			copierWasNil bool
+		)
+		migrations := []MigrationConfig{{
+			Name:          "copier-mig",
+			Version:       1,
+			SchemaVersion: 1,
+			MigrationFnWithCopier: func(_ *sqlc.Queries,
+				copier BulkCopier) error {
+
+				called = true
+				copierWasNil = copier == nil
+
+				return nil
+			},
+		}}
+
+		require.NoError(t, db.ApplyAllMigrations(ctxb, migrations))
+		require.True(t, called, "copier migration fn not called")
+
+		version, err := db.GetBaseDB().GetDatabaseVersion(ctxb)
+		require.NoError(t, err)
+
+		return copierWasNil, version
+	}
+
+	t.Run("sqlite", func(t *testing.T) {
+		dbFileName := filepath.Join(t.TempDir(), "tmp.db")
+		db, err := NewSqliteStore(&SqliteConfig{
+			SkipMigrations: false,
+		}, dbFileName)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, db.DB.Close()) })
+
+		copierWasNil, version := runOnce(t, db)
+		require.True(t, copierWasNil, "copier must be nil on SQLite")
+		require.EqualValues(t, 1, version)
+	})
+
+	t.Run("postgres", func(t *testing.T) {
+		fixture := NewTestPgFixture(t, DefaultPostgresFixtureLifetime)
+		t.Cleanup(func() { fixture.TearDown(t) })
+
+		dbName := randomDBName(t)
+		_, err := fixture.db.ExecContext(
+			ctxb, "CREATE DATABASE "+dbName,
+		)
+		require.NoError(t, err)
+
+		cfg := fixture.GetConfig(dbName)
+		cfg.SkipMigrations = false
+		db, err := NewPostgresStore(cfg)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, db.DB.Close()) })
+
+		copierWasNil, version := runOnce(t, db)
+		require.False(t, copierWasNil, "copier must be set on Postgres")
+		require.EqualValues(t, 1, version)
+	})
+}
+
 // TestMigrationBug19RC1 tests a bug that was present in the migration code
 // at the v0.19.0-rc1 release.
 // The bug was fixed in: https://github.com/lightningnetwork/lnd/pull/9647

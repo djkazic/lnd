@@ -114,6 +114,23 @@ type SQLMigrationQueries interface {
 	// InsertPaymentDuplicateMig inserts a duplicate payment record during
 	// migration.
 	InsertPaymentDuplicateMig(ctx context.Context, arg sqlc.InsertPaymentDuplicateMigParams) (int64, error)
+
+	// Bulk migration inserts. These collapse the per-row inserts above into
+	// chunked multi-row INSERT statements so a whole batch of payments can
+	// be written with a handful of round-trips instead of one per row.
+	BulkInsertPaymentsMig(ctx context.Context, params []sqlc.InsertPaymentMigParams) ([]sqlc.BulkPaymentIDMig, error)
+	BulkInsertPaymentIntents(ctx context.Context, params []sqlc.InsertPaymentIntentParams) error
+	BulkInsertPaymentFirstHopCustomRecords(ctx context.Context, params []sqlc.InsertPaymentFirstHopCustomRecordParams) error
+	BulkInsertHtlcAttempts(ctx context.Context, params []sqlc.InsertHtlcAttemptParams) error
+	BulkInsertPaymentAttemptFirstHopCustomRecords(ctx context.Context, params []sqlc.InsertPaymentAttemptFirstHopCustomRecordParams) error
+	BulkInsertRouteHops(ctx context.Context, params []sqlc.InsertRouteHopParams) ([]sqlc.BulkHopID, error)
+	BulkInsertRouteHopBlinded(ctx context.Context, params []sqlc.InsertRouteHopBlindedParams) error
+	BulkInsertRouteHopMpp(ctx context.Context, params []sqlc.InsertRouteHopMppParams) error
+	BulkInsertRouteHopAmp(ctx context.Context, params []sqlc.InsertRouteHopAmpParams) error
+	BulkInsertPaymentHopCustomRecords(ctx context.Context, params []sqlc.InsertPaymentHopCustomRecordParams) error
+	BulkSettleAttempts(ctx context.Context, params []sqlc.SettleAttemptParams) error
+	BulkFailAttempts(ctx context.Context, params []sqlc.FailAttemptParams) error
+	BulkInsertPaymentDuplicatesMig(ctx context.Context, params []sqlc.InsertPaymentDuplicateMigParams) error
 }
 
 // BatchedSQLQueries is a version of the SQLQueries that's capable
@@ -136,6 +153,26 @@ var _ DB = (*SQLStore)(nil)
 type SQLStoreConfig struct {
 	// QueryConfig holds configuration values for SQL queries.
 	QueryCfg *sqldb.QueryConfig
+
+	// Copier, when non-nil, is used by the migration to bulk-load the
+	// highest-volume tables via the Postgres COPY protocol instead of
+	// multi-row INSERT. It must operate within the same transaction as the
+	// migration's SQL queries. It is only set for Postgres (pgx) targets;
+	// when nil the migration falls back to multi-row INSERT (used for
+	// SQLite and any non-pgx backend).
+	Copier BulkCopier
+}
+
+// BulkCopier bulk-loads rows into a table using the backend's fastest bulk
+// path (Postgres COPY). Implementations must run within the migration's
+// transaction so the load is atomic with the rest of the migration. Keeping
+// this an interface lets the migration stay backend-agnostic: the pgx-specific
+// implementation is injected by the caller.
+type BulkCopier interface {
+	// CopyInto bulk-loads rows (row-major, one []any per row matching cols)
+	// into table and returns the number of rows loaded.
+	CopyInto(ctx context.Context, table string, cols []string,
+		rows [][]any) (int64, error)
 }
 
 // NewSQLStore creates a new SQLStore instance given an open

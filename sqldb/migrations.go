@@ -168,6 +168,16 @@ type MigrationConfig struct {
 	// performed through SQL alone. If set to nil, no custom migration is
 	// applied.
 	MigrationFn func(tx *sqlc.Queries) error
+
+	// MigrationFnWithCopier is an alternative to MigrationFn for migrations
+	// that want to use the Postgres COPY protocol for bulk loading. When
+	// set (and MigrationFn is nil), the migration runs on a dedicated
+	// *sql.Conn so the provided BulkCopier can COPY within the migration
+	// transaction. The copier is nil on non-Postgres backends, in which
+	// case the migration must fall back to regular inserts.
+	//
+	// Migrations must set at most one of MigrationFn / MigrationFnWithCopier.
+	MigrationFnWithCopier func(tx *sqlc.Queries, copier BulkCopier) error
 }
 
 // MigrationTarget is a functional option that can be passed to applyMigrations
@@ -495,26 +505,42 @@ func ApplyMigrations(ctx context.Context, db *BaseDB,
 
 		opts := WriteTxOpt()
 
-		// Run the custom migration as a transaction to ensure
-		// atomicity. If successful, mark the migration as complete in
-		// the migration tracker table.
-		err = executor.ExecTx(ctx, opts, func(tx *sqlc.Queries) error {
-			// Apply the migration function if one is provided.
-			if migration.MigrationFn != nil {
+		// runMigrationBody applies the custom migration function (if
+		// any) and marks the migration complete in the tracker table,
+		// all within the caller-supplied transaction so they commit
+		// atomically. copier is non-nil only for the COPY path below.
+		runMigrationBody := func(tx *sqlc.Queries,
+			copier BulkCopier) error {
+
+			var fnErr error
+			switch {
+			case migration.MigrationFnWithCopier != nil:
 				log.Infof("Applying custom migration '%v' "+
 					"(version %d) to schema version %d",
 					migration.Name, migration.Version,
 					migration.SchemaVersion)
 
-				err = migration.MigrationFn(tx)
-				if err != nil {
-					return fmt.Errorf("error applying "+
-						"migration '%v' (version %d) "+
-						"to schema version %d: %w",
-						migration.Name,
-						migration.Version,
-						migration.SchemaVersion, err)
-				}
+				fnErr = migration.MigrationFnWithCopier(
+					tx, copier,
+				)
+
+			case migration.MigrationFn != nil:
+				log.Infof("Applying custom migration '%v' "+
+					"(version %d) to schema version %d",
+					migration.Name, migration.Version,
+					migration.SchemaVersion)
+
+				fnErr = migration.MigrationFn(tx)
+			}
+			if fnErr != nil {
+				return fmt.Errorf("error applying migration "+
+					"'%v' (version %d) to schema version "+
+					"%d: %w", migration.Name,
+					migration.Version,
+					migration.SchemaVersion, fnErr)
+			}
+			if migration.MigrationFn != nil ||
+				migration.MigrationFnWithCopier != nil {
 
 				log.Infof("Migration '%v' (version %d) "+
 					"applied ", migration.Name,
@@ -535,7 +561,34 @@ func ApplyMigrations(ctx context.Context, db *BaseDB,
 			}
 
 			return nil
-		}, func() {})
+		}
+
+		// Migrations that opt into the COPY protocol run on a dedicated
+		// connection so the copier can COPY within the migration
+		// transaction; all others use the standard pooled executor,
+		// preserving their existing behavior.
+		if migration.MigrationFnWithCopier != nil {
+			conn, connErr := db.Conn(ctx)
+			if connErr != nil {
+				return fmt.Errorf("error acquiring migration "+
+					"connection: %w", connErr)
+			}
+
+			copier := newBulkCopier(conn)
+			err = execConnMigrationTx(
+				ctx, db, conn, opts,
+				func(tx *sqlc.Queries) error {
+					return runMigrationBody(tx, copier)
+				},
+			)
+			_ = conn.Close()
+		} else {
+			err = executor.ExecTx(
+				ctx, opts, func(tx *sqlc.Queries) error {
+					return runMigrationBody(tx, nil)
+				}, func() {},
+			)
+		}
 		if err != nil {
 			return err
 		}

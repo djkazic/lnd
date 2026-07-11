@@ -5,13 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"math"
-	"strconv"
 	"time"
 
 	"github.com/lightningnetwork/lnd/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
-	"github.com/lightningnetwork/lnd/payments/db/migration1/lnwire"
 	"github.com/lightningnetwork/lnd/payments/db/migration1/sqlc"
 	"golang.org/x/time/rate"
 )
@@ -135,8 +132,18 @@ func MigratePaymentsKVToSQL(ctx context.Context, kvBackend kvdb.Backend,
 
 	log.Infof("Starting payment migration from KV to SQL...")
 
+	// If the KV backend is SQL-backed (postgres_kvdb / sqlite_kvdb), read
+	// payments in bulk directly from the underlying table instead of doing
+	// one round-trip per bucket/Get/cursor step. bbolt backends fall back to
+	// the per-bucket traversal below, which is cheap for a local mmap'd file.
+	if reader, ok := kvBackend.(kvBulkReader); ok {
+		return migratePaymentsBulk(
+			ctx, reader, kvBackend, sqlDB, cfg, stats, startTime,
+		)
+	}
+
 	var (
-		validationBatch []migratedPaymentRef
+		batch []*preparedPayment
 
 		reportInterval = rate.Sometimes{Interval: 5 * time.Second}
 	)
@@ -188,11 +195,30 @@ func MigratePaymentsKVToSQL(ctx context.Context, kvBackend kvdb.Backend,
 		return indexes.ForEach(func(seqKey, indexVal []byte) error {
 			reportInterval.Do(reporter.report)
 
-			return migrateIndexEntry(
-				ctx, seqKey, indexVal, paymentsBucket,
-				kvBackend, sqlDB, cfg, stats, &validationBatch,
+			prep, err := prepareIndexEntry(
+				seqKey, indexVal, paymentsBucket, stats,
 				attemptIDAllocator,
 			)
+			if err != nil {
+				return err
+			}
+			if prep == nil {
+				return nil
+			}
+
+			batch = append(batch, prep)
+			if uint32(len(batch)) < cfg.QueryCfg.MaxBatchSize {
+				return nil
+			}
+
+			if err := flushAndValidateBatch(
+				ctx, kvBackend, sqlDB, cfg, batch,
+			); err != nil {
+				return err
+			}
+			batch = batch[:0]
+
+			return nil
 		})
 	}, func() {})
 
@@ -200,14 +226,27 @@ func MigratePaymentsKVToSQL(ctx context.Context, kvBackend kvdb.Backend,
 		return fmt.Errorf("migrate payments: %w", err)
 	}
 
-	// Validate any remaining payments in the batch.
-	if len(validationBatch) > 0 {
-		if err := validateMigratedPaymentBatch(
-			ctx, kvBackend, sqlDB, cfg, validationBatch,
+	// Flush and validate any remaining payments in the batch.
+	if len(batch) > 0 {
+		if err := flushAndValidateBatch(
+			ctx, kvBackend, sqlDB, cfg, batch,
 		); err != nil {
 			return err
 		}
 	}
+
+	return finishMigration(
+		ctx, kvBackend, sqlDB, stats, startTime, attemptIDAllocator,
+	)
+}
+
+// finishMigration performs the shared post-migration steps: a final payment
+// count sanity check, advancing the switch payment ID sequencer past any
+// synthetic legacy attempt IDs, recording the duration and printing the
+// summary.
+func finishMigration(ctx context.Context, kvBackend kvdb.Backend,
+	sqlDB SQLMigrationQueries, stats *MigrationStats, startTime time.Time,
+	attemptIDAllocator *attemptIDAllocator) error {
 
 	// Validate the total number of payments as an additional sanity check.
 	if err := validatePaymentCounts(
@@ -390,19 +429,19 @@ func advanceSwitchPaymentIDSequence(kvBackend kvdb.Backend,
 	}, func() {})
 }
 
-// migrateIndexEntry processes a single entry from the payments index bucket,
-// migrating the corresponding payment to SQL and appending it to the
-// validation batch.
-func migrateIndexEntry(ctx context.Context, seqKey, indexVal []byte,
-	paymentsBucket kvdb.RBucket, kvBackend kvdb.Backend,
-	sqlDB SQLMigrationQueries, cfg *SQLStoreConfig, stats *MigrationStats,
-	validationBatch *[]migratedPaymentRef,
-	attemptIDAllocator *attemptIDAllocator) error {
+// prepareIndexEntry processes a single entry from the payments index bucket,
+// parsing the corresponding payment (and any duplicates) into a preparedPayment
+// ready for bulk insertion. It returns nil (with a nil error) for entries that
+// should be skipped: a missing payment bucket, or a sequence pointer belonging
+// to a duplicate payment.
+func prepareIndexEntry(seqKey, indexVal []byte, paymentsBucket kvdb.RBucket,
+	stats *MigrationStats,
+	attemptIDAllocator *attemptIDAllocator) (*preparedPayment, error) {
 
 	r := bytes.NewReader(indexVal)
 	paymentHash, err := deserializePaymentIndex(r)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	paymentBucket := paymentsBucket.NestedReadBucket(paymentHash[:])
@@ -413,173 +452,79 @@ func migrateIndexEntry(ctx context.Context, seqKey, indexVal []byte,
 		log.Warnf("Missing bucket for payment %x", paymentHash[:8])
 		stats.SkippedPayments++
 
-		return nil
+		return nil, nil
 	}
 
 	// Every payment bucket should have a sequence number which is
 	// also important to check for duplicates.
 	seqBytes := paymentBucket.Get(paymentSequenceKey)
 	if seqBytes == nil {
-		return ErrNoSequenceNumber
+		return nil, ErrNoSequenceNumber
 	}
 
 	// Skip duplicates. They are migrated into the payment_duplicates
 	// table when the primary payment is processed.
 	if !bytes.Equal(seqBytes, seqKey) {
-		return nil
+		return nil, nil
 	}
 
 	// Fetch the payment from the kv store.
 	payment, err := fetchPayment(paymentBucket)
 	if err != nil {
-		return fmt.Errorf("fetch payment %x: %w", paymentHash[:8], err)
-	}
-
-	// Migrate the payment to the SQL database.
-	paymentID, err := migratePayment(
-		ctx, payment, paymentHash, sqlDB, stats, attemptIDAllocator,
-	)
-	if err != nil {
-		return fmt.Errorf("migrate payment %x: %w", paymentHash[:8],
+		return nil, fmt.Errorf("fetch payment %x: %w", paymentHash[:8],
 			err)
 	}
 
-	// Migrate any duplicate payments for this hash.
+	// Parse the payment into bulk-insertable params.
+	prep, err := preparePayment(
+		payment, paymentHash, stats, attemptIDAllocator,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("prepare payment %x: %w",
+			paymentHash[:8], err)
+	}
+
+	// Parse any duplicate payments for this hash so they can be bulk
+	// inserted alongside the primary payment.
 	dupBucket := paymentBucket.NestedReadBucket(duplicatePaymentsBucket)
 	if dupBucket != nil {
-		err = migrateDuplicatePayments(
-			ctx, dupBucket, paymentHash, paymentID, sqlDB, stats,
+		prep.hasDuplicates = true
+		duplicates, err := prepareDuplicatePayments(
+			dupBucket, paymentHash, stats,
 		)
 		if err != nil {
-			return fmt.Errorf("migrate duplicates %x: %w",
+			return nil, fmt.Errorf("prepare duplicates %x: %w",
 				paymentHash[:8], err)
 		}
+		prep.duplicates = duplicates
 	}
 
-	// Add the payment to the validation batch.
-	*validationBatch = append(*validationBatch, migratedPaymentRef{
-		Hash:      paymentHash,
-		PaymentID: paymentID,
-	})
-	if uint32(len(*validationBatch)) >= cfg.QueryCfg.MaxBatchSize {
-		err := validateMigratedPaymentBatch(
-			ctx, kvBackend, sqlDB, cfg, *validationBatch,
-		)
-		if err != nil {
-			return err
-		}
-
-		*validationBatch = (*validationBatch)[:0]
-	}
-
-	return nil
+	return prep, nil
 }
 
-// migratePayment migrates a single payment from KV to SQL.
-func migratePayment(ctx context.Context, payment *MPPayment, hash lntypes.Hash,
-	sqlDB SQLMigrationQueries, stats *MigrationStats,
-	attemptIDAllocator *attemptIDAllocator) (int64, error) {
+// flushAndValidateBatch bulk-inserts a whole batch of prepared payments and
+// then validates the migrated batch against the source KV data.
+func flushAndValidateBatch(ctx context.Context, kvBackend kvdb.Backend,
+	sqlDB SQLMigrationQueries, cfg *SQLStoreConfig,
+	batch []*preparedPayment) error {
 
-	if payment.Status == StatusInFlight {
-		terminalizedLegacyAttempts, err :=
-			terminalizeUnresolvedLegacyZeroAttempts(payment)
-		if err != nil {
-			return 0, err
-		}
-		if terminalizedLegacyAttempts > 0 {
-			log.Warnf("Terminalized %d unresolved legacy HTLC "+
-				"attempt(s) with unknown attempt ID zero for "+
-				"payment %x; the parent payment was failed if "+
-				"no other settled or in-flight HTLC kept "+
-				"it active", terminalizedLegacyAttempts,
-				hash[:8])
-		}
+	if err := flushPaymentBatch(
+		ctx, sqlDB, cfg.Copier, batch,
+	); err != nil {
+		return err
 	}
 
-	// Update migration stats based on payment status.
-	switch payment.Status {
-	case StatusSucceeded:
-		stats.SuccessfulPayments++
-
-	case StatusFailed:
-		stats.FailedPayments++
-
-	case StatusInFlight:
-		stats.InFlightPayments++
-
-	case StatusInitiated:
-		stats.InitiatedPayments++
-	}
-
-	// Prepare fail reason for SQL insert.
-	var failReason sql.NullInt32
-	if payment.FailureReason != nil {
-		failReason = sql.NullInt32{
-			Int32: int32(*payment.FailureReason),
-			Valid: true,
-		}
-	}
-
-	// Insert payment using migration query.
-	paymentID, err := sqlDB.InsertPaymentMig(
-		ctx, sqlc.InsertPaymentMigParams{
-			AmountMsat: int64(payment.Info.Value),
-			CreatedAt: normalizeTimeForSQL(
-				payment.Info.CreationTime,
-			),
-			PaymentIdentifier: hash[:],
-			FailReason:        failReason,
+	refs := make([]migratedPaymentRef, 0, len(batch))
+	for _, p := range batch {
+		refs = append(refs, migratedPaymentRef{
+			Hash:          p.hash,
+			PaymentID:     p.paymentID,
+			Payment:       p.payment,
+			HasDuplicates: p.hasDuplicates,
 		})
-	if err != nil {
-		return 0, fmt.Errorf("insert payment: %w", err)
 	}
 
-	// Insert payment intent.
-	//
-	// Only insert a row if we have an actual intent payload. For legacy
-	// hash-only/keysend-style payments, the intent may be absent.
-	if len(payment.Info.PaymentRequest) > 0 {
-		_, err = sqlDB.InsertPaymentIntent(
-			ctx, sqlc.InsertPaymentIntentParams{
-				PaymentID:     paymentID,
-				IntentType:    int16(PaymentIntentTypeBolt11),
-				IntentPayload: payment.Info.PaymentRequest,
-			},
-		)
-		if err != nil {
-			return 0, fmt.Errorf("insert intent: %w", err)
-		}
-	}
-
-	// Insert first hop custom records (payment level).
-	for key, value := range payment.Info.FirstHopCustomRecords {
-		err = sqlDB.InsertPaymentFirstHopCustomRecord(ctx,
-			sqlc.InsertPaymentFirstHopCustomRecordParams{
-				PaymentID: paymentID,
-				Key:       int64(key),
-				Value:     value,
-			},
-		)
-		if err != nil {
-			return 0, fmt.Errorf("insert custom record: %w", err)
-		}
-	}
-
-	// Migrate HTLC attempts.
-	for _, htlc := range payment.HTLCs {
-		err = migrateHTLCAttempt(
-			ctx, paymentID, hash, &htlc, sqlDB, stats,
-			attemptIDAllocator,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("migrate attempt %d: %w",
-				htlc.AttemptID, err)
-		}
-	}
-
-	stats.TotalPayments++
-
-	return paymentID, nil
+	return validateMigratedPaymentBatch(ctx, kvBackend, sqlDB, cfg, refs)
 }
 
 // terminalizeUnresolvedLegacyZeroAttempts marks unresolved legacy zero-ID HTLC
@@ -636,287 +581,15 @@ func terminalizeUnresolvedLegacyZeroAttempts(payment *MPPayment) (int, error) {
 	return terminalizedLegacyAttempts, nil
 }
 
-// migrateHTLCAttempt migrates a single HTLC attempt.
-func migrateHTLCAttempt(ctx context.Context, paymentID int64,
-	parentPaymentHash lntypes.Hash, htlc *HTLCAttempt, sqlDB SQLQueries,
-	stats *MigrationStats, attemptIDAllocator *attemptIDAllocator) error {
+// prepareDuplicatePayments parses duplicate payments from the KV duplicates
+// bucket into bulk-insertable params (payment_id is assigned at flush time).
+func prepareDuplicatePayments(dupBucket kvdb.RBucket, hash [32]byte,
+	stats *MigrationStats) ([]preparedDuplicate, error) {
 
-	// Determine the payment hash for this HTLC attempt.
-	//
-	// For AMP payments, each HTLC has its own unique hash. For non-AMP
-	// payments (MPP, Legacy), all HTLCs use the same hash as the parent
-	// payment. Older payment attempts may not have the hash stored
-	// explicitly, in which case we fall back to the parent payment hash
-	// which is ok since non-AMP payments have a single hash for all HTLCs.
-	var paymentHash []byte
-	switch {
-	case htlc.Hash != nil:
-		paymentHash = (*htlc.Hash)[:]
-
-	default:
-		// For older payments where Hash is nil, use the parent payment
-		// hash. This is consistent with how the router handles these
-		// legacy payments.
-		paymentHash = parentPaymentHash[:]
-	}
-
-	firstHopAmountMsat := int64(htlc.Route.FirstHopAmount.Val.Int())
-
-	sessionKey := htlc.SessionKey()
-	if sessionKey == nil {
-		return fmt.Errorf("HTLC attempt %d for payment %x is "+
-			"missing session key", htlc.AttemptID,
-			parentPaymentHash[:8])
-	}
-
-	sessionKeyBytes := sessionKey.Serialize()
-
-	attemptID := htlc.AttemptID
-	if attemptID == 0 {
-		var err error
-		attemptID, err = attemptIDAllocator.allocateLegacyAttemptID()
-		if err != nil {
-			return fmt.Errorf("allocate legacy attempt ID: %w", err)
-		}
-
-		log.Warnf("Allocated HTLC attempt index %d from switch "+
-			"sequencer for legacy payment %x with unknown "+
-			"attempt ID", attemptID,
-			parentPaymentHash[:8])
-	}
-
-	if attemptID > math.MaxInt64 {
-		return fmt.Errorf("unable to convert HTLC attempt ID to "+
-			"SQL attempt index: attempt_id=%d payment=%x max=%d",
-			attemptID, parentPaymentHash[:8], uint64(math.MaxInt64))
-	}
-
-	attemptIndex := int64(attemptID)
-
-	// Insert HTLC attempt.
-	_, err := sqlDB.InsertHtlcAttempt(ctx, sqlc.InsertHtlcAttemptParams{
-		PaymentID:          paymentID,
-		AttemptIndex:       attemptIndex,
-		SessionKey:         sessionKeyBytes,
-		AttemptTime:        normalizeTimeForSQL(htlc.AttemptTime),
-		PaymentHash:        paymentHash,
-		FirstHopAmountMsat: firstHopAmountMsat,
-		RouteTotalTimeLock: int32(htlc.Route.TotalTimeLock),
-		RouteTotalAmount:   int64(htlc.Route.TotalAmount),
-		RouteSourceKey:     htlc.Route.SourcePubKey[:],
-	})
-	if err != nil {
-		// SQL unique constraint errors do not include the conflicting
-		// value. Include the attempted index so failures point directly
-		// at the problematic legacy attempt.
-		return fmt.Errorf("unable to insert HTLC attempt: "+
-			"index=%d payment=%x original_attempt_id=%d: %w",
-			attemptIndex, parentPaymentHash[:8],
-			htlc.AttemptID, err)
-	}
-
-	// Insert the route-level first hop custom records.
-	for key, value := range htlc.Route.FirstHopWireCustomRecords {
-		err = sqlDB.InsertPaymentAttemptFirstHopCustomRecord(
-			ctx,
-			sqlc.InsertPaymentAttemptFirstHopCustomRecordParams{
-				HtlcAttemptIndex: attemptIndex,
-				Key:              int64(key),
-				Value:            value,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("insert attempt first hop custom "+
-				"record: %w", err)
-		}
-	}
-
-	// Insert route hops.
-	for hopIndex := range htlc.Route.Hops {
-		hop := htlc.Route.Hops[hopIndex]
-		err = migrateRouteHop(
-			ctx, attemptIndex, hopIndex, hop,
-			sqlDB, stats,
-		)
-		if err != nil {
-			return fmt.Errorf("migrate hop %d: %w", hopIndex, err)
-		}
-	}
-
-	// Handle attempt resolution (settle or fail).
-	switch {
-	case htlc.Settle != nil:
-		// Settled
-		err = sqlDB.SettleAttempt(ctx, sqlc.SettleAttemptParams{
-			AttemptIndex: attemptIndex,
-			ResolutionTime: normalizeTimeForSQL(
-				htlc.Settle.SettleTime,
-			),
-			ResolutionType: int32(HTLCAttemptResolutionSettled),
-			SettlePreimage: htlc.Settle.Preimage[:],
-		})
-		if err != nil {
-			return fmt.Errorf("settle attempt: %w", err)
-		}
-
-		stats.SettledAttempts++
-
-	case htlc.Failure != nil:
-		var failureMsg bytes.Buffer
-		if htlc.Failure.Message != nil {
-			err := lnwire.EncodeFailureMessage(
-				&failureMsg, htlc.Failure.Message, 0,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to encode "+
-					"failure message: %w", err)
-			}
-		}
-
-		err = sqlDB.FailAttempt(ctx, sqlc.FailAttemptParams{
-			AttemptIndex: attemptIndex,
-			ResolutionTime: normalizeTimeForSQL(
-				htlc.Failure.FailTime,
-			),
-			ResolutionType: int32(HTLCAttemptResolutionFailed),
-			FailureSourceIndex: sql.NullInt32{
-				Int32: int32(htlc.Failure.FailureSourceIndex),
-				Valid: true,
-			},
-			HtlcFailReason: sql.NullInt32{
-				Int32: int32(htlc.Failure.Reason),
-				Valid: true,
-			},
-			FailureMsg: failureMsg.Bytes(),
-		})
-		if err != nil {
-			return fmt.Errorf("fail attempt: %w", err)
-		}
-
-		stats.FailedAttempts++
-
-	default:
-		// If the attempt is not settled or failed, it is in flight.
-		stats.InFlightAttempts++
-	}
-
-	stats.TotalAttempts++
-
-	return nil
-}
-
-// migrateRouteHop migrates a single route hop.
-func migrateRouteHop(ctx context.Context,
-	attemptID int64, hopIndex int, hop *Hop, sqlDB SQLQueries,
-	stats *MigrationStats) error {
-
-	// Convert channel ID to string representation of uint64.
-	// The SCID is stored as a decimal string to match the converter
-	// expectations (sql_converters.go:173).
-	scidStr := strconv.FormatUint(hop.ChannelID, 10)
-
-	// Insert route hop.
-	hopID, err := sqlDB.InsertRouteHop(ctx, sqlc.InsertRouteHopParams{
-		HtlcAttemptIndex: attemptID,
-		HopIndex:         int32(hopIndex),
-		PubKey:           hop.PubKeyBytes[:],
-		Scid:             scidStr,
-		OutgoingTimeLock: int32(hop.OutgoingTimeLock),
-		AmtToForward:     int64(hop.AmtToForward),
-		MetaData:         hop.Metadata,
-	})
-	if err != nil {
-		return fmt.Errorf("insert hop: %w", err)
-	}
-
-	// Check for blinded route data (route blinding).
-	if len(hop.EncryptedData) > 0 || hop.BlindingPoint != nil ||
-		hop.TotalAmtMsat != 0 {
-
-		var blindingPoint []byte
-		if hop.BlindingPoint != nil {
-			blindingPoint = hop.BlindingPoint.SerializeCompressed()
-		}
-
-		var totalAmt sql.NullInt64
-		if hop.TotalAmtMsat != 0 {
-			totalAmt = sql.NullInt64{
-				Int64: int64(hop.TotalAmtMsat),
-				Valid: true,
-			}
-		}
-
-		err := sqlDB.InsertRouteHopBlinded(
-			ctx, sqlc.InsertRouteHopBlindedParams{
-				HopID:               hopID,
-				EncryptedData:       hop.EncryptedData,
-				BlindingPoint:       blindingPoint,
-				BlindedPathTotalAmt: totalAmt,
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("insert blinded hop: %w", err)
-		}
-	}
-
-	// Check for MPP record.
-	if hop.MPP != nil {
-		paymentAddr := hop.MPP.PaymentAddr()
-		err = sqlDB.InsertRouteHopMpp(ctx, sqlc.InsertRouteHopMppParams{
-			HopID:       hopID,
-			PaymentAddr: paymentAddr[:],
-			TotalMsat:   int64(hop.MPP.TotalMsat()),
-		})
-		if err != nil {
-			return fmt.Errorf("insert MPP: %w", err)
-		}
-	}
-
-	// Check for AMP record.
-	if hop.AMP != nil {
-		rootShare := hop.AMP.RootShare()
-		setID := hop.AMP.SetID()
-		err = sqlDB.InsertRouteHopAmp(ctx, sqlc.InsertRouteHopAmpParams{
-			HopID:      hopID,
-			RootShare:  rootShare[:],
-			SetID:      setID[:],
-			ChildIndex: int32(hop.AMP.ChildIndex()),
-		})
-		if err != nil {
-			return fmt.Errorf("insert AMP: %w", err)
-		}
-	}
-
-	// Check for custom records.
-	if hop.CustomRecords != nil {
-		for tlvType, value := range hop.CustomRecords {
-			err = sqlDB.InsertPaymentHopCustomRecord(
-				ctx,
-				sqlc.InsertPaymentHopCustomRecordParams{
-					HopID: hopID,
-					Key:   int64(tlvType),
-					Value: value,
-				},
-			)
-			if err != nil {
-				return fmt.Errorf("insert hop custom "+
-					"record: %w", err)
-			}
-		}
-	}
-
-	stats.TotalHops++
-
-	return nil
-}
-
-// migrateDuplicatePayments migrates duplicate payments into the dedicated
-// payment_duplicates table.
-func migrateDuplicatePayments(ctx context.Context, dupBucket kvdb.RBucket,
-	hash [32]byte, primaryPaymentID int64, sqlDB SQLMigrationQueries,
-	stats *MigrationStats) error {
-
-	duplicateCount := 0
+	var (
+		duplicates     []preparedDuplicate
+		duplicateCount int
+	)
 
 	err := dupBucket.ForEach(func(seqBytes, _ []byte) error {
 		// The duplicates bucket should only contain nested buckets
@@ -940,17 +613,23 @@ func migrateDuplicatePayments(ctx context.Context, dupBucket kvdb.RBucket,
 		log.Infof("Migrating duplicate payment seq=%d for "+
 			"payment %x", seqNum, hash[:8])
 
-		err := migrateSingleDuplicatePayment(
-			ctx, subBucket, hash, primaryPaymentID, seqNum,
-			sqlDB,
+		params, err := parseSingleDuplicatePayment(
+			subBucket, hash, seqNum,
 		)
 		if err != nil {
-			return fmt.Errorf("migrate duplicate payment "+
+			return fmt.Errorf("prepare duplicate payment "+
 				"seq=%d: %w", seqNum, err)
 		}
 
+		duplicates = append(duplicates, preparedDuplicate{
+			params: params,
+		})
+
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	if duplicateCount > 0 {
 		stats.DuplicatePayments++
@@ -960,18 +639,20 @@ func migrateDuplicatePayments(ctx context.Context, dupBucket kvdb.RBucket,
 			duplicateCount)
 	}
 
-	return err
+	return duplicates, nil
 }
 
-// migrateSingleDuplicatePayment inserts a duplicate payment record for the
-// given payment hash into payment_duplicates.
-func migrateSingleDuplicatePayment(ctx context.Context, dupBucket kvdb.RBucket,
-	hash [32]byte, primaryPaymentID int64, duplicateSeq uint64,
-	sqlDB SQLMigrationQueries) error {
+// parseSingleDuplicatePayment parses a duplicate payment record for the given
+// payment hash into bulk-insertable params (without the primary payment_id,
+// which is set at flush time).
+func parseSingleDuplicatePayment(dupBucket kvdb.RBucket, hash [32]byte,
+	duplicateSeq uint64) (sqlc.InsertPaymentDuplicateMigParams, error) {
+
+	var zero sqlc.InsertPaymentDuplicateMigParams
 
 	creationData := dupBucket.Get(duplicatePaymentCreationInfoKey)
 	if creationData == nil {
-		return fmt.Errorf("duplicate payment seq=%d missing "+
+		return zero, fmt.Errorf("duplicate payment seq=%d missing "+
 			"creation info (payment=%x)", duplicateSeq, hash[:8])
 	}
 
@@ -979,7 +660,7 @@ func migrateSingleDuplicatePayment(ctx context.Context, dupBucket kvdb.RBucket,
 		bytes.NewReader(creationData),
 	)
 	if err != nil {
-		return fmt.Errorf("deserialize duplicate creation "+
+		return zero, fmt.Errorf("deserialize duplicate creation "+
 			"info: %w", err)
 	}
 
@@ -988,7 +669,7 @@ func migrateSingleDuplicatePayment(ctx context.Context, dupBucket kvdb.RBucket,
 	attemptData := dupBucket.Get(duplicatePaymentAttemptInfoKey)
 
 	if settleData != nil && len(failReasonData) > 0 {
-		return fmt.Errorf("duplicate payment seq=%d has both "+
+		return zero, fmt.Errorf("duplicate payment seq=%d has both "+
 			"settle and fail info (payment=%x)", duplicateSeq,
 			hash[:8])
 	}
@@ -1005,7 +686,7 @@ func migrateSingleDuplicatePayment(ctx context.Context, dupBucket kvdb.RBucket,
 			settleData,
 		)
 		if err != nil {
-			return err
+			return zero, err
 		}
 
 	case len(failReasonData) > 0:
@@ -1037,23 +718,15 @@ func migrateSingleDuplicatePayment(ctx context.Context, dupBucket kvdb.RBucket,
 		}
 	}
 
-	_, err = sqlDB.InsertPaymentDuplicateMig(
-		ctx, sqlc.InsertPaymentDuplicateMigParams{
-			PaymentID:  primaryPaymentID,
-			AmountMsat: int64(creationInfo.Value),
-			CreatedAt: normalizeTimeForSQL(
-				creationInfo.CreationTime,
-			),
-			FailReason:     failReason,
-			SettlePreimage: settlePreimage,
-			SettleTime:     settleTime,
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("insert duplicate payment: %w", err)
-	}
-
-	return nil
+	return sqlc.InsertPaymentDuplicateMigParams{
+		AmountMsat: int64(creationInfo.Value),
+		CreatedAt: normalizeTimeForSQL(
+			creationInfo.CreationTime,
+		),
+		FailReason:     failReason,
+		SettlePreimage: settlePreimage,
+		SettleTime:     settleTime,
+	}, nil
 }
 
 // parseDuplicateSettleData extracts settle data from either legacy or modern

@@ -1184,14 +1184,26 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 				return nil
 			}
 
-			paymentMig := func(tx *sqlc.Queries) error {
+			paymentMig := func(tx *sqlc.Queries,
+				copier sqldb.BulkCopier) error {
+
+				cfg := &paymentsmig1.SQLStoreConfig{
+					QueryCfg: queryCfg,
+				}
+
+				// On Postgres the migration framework provides a
+				// COPY copier bound to the migration transaction;
+				// it is nil on SQLite, in which case the
+				// migration falls back to multi-row INSERT.
+				if copier != nil {
+					cfg.Copier = copier
+				}
+
 				err := paymentsmig1.MigratePaymentsKVToSQL(
 					ctx,
 					dbs.ChanStateDB.Backend,
 					paymentsmig1sqlc.New(tx.GetTx()),
-					&paymentsmig1.SQLStoreConfig{
-						QueryCfg: queryCfg,
-					},
+					cfg,
 				)
 				if err != nil {
 					return fmt.Errorf("failed to migrate "+
@@ -1217,7 +1229,8 @@ func (d *DefaultDatabaseBuilder) BuildDatabase(
 					continue
 
 				case paymentMigration:
-					migrations[i].MigrationFn = paymentMig
+					migrations[i].MigrationFnWithCopier =
+						paymentMig
 
 					continue
 

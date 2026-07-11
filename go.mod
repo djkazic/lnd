@@ -204,6 +204,18 @@ require (
 	sigs.k8s.io/yaml v1.2.0 // indirect
 )
 
+// Temporary: use the local kvdb module so the sqlbase bulk-read accessor
+// (KVTableName/KVBulkQuery) used by the payments migration is compiled in.
+// This must be released in the kvdb module and the require bumped before the
+// migration bulk-read path can land without a replace.
+replace github.com/lightningnetwork/lnd/kvdb => ./kvdb
+
+// Temporary: use the local sqldb module so the migration BulkCopier + COPY
+// support (MigrationFnWithCopier) used by the payments migration is compiled
+// in. Must be released and the require bumped before this can land without a
+// replace.
+replace github.com/lightningnetwork/lnd/sqldb => ./sqldb
+
 // This replace is for https://github.com/advisories/GHSA-25xm-hr59-7c27
 replace github.com/ulikunitz/xz => github.com/ulikunitz/xz v0.5.11
 
